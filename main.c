@@ -56,7 +56,7 @@ int			send(uint8_t c);
 int			send_buf(uint8_t *p, unsigned count);
 int			get_sync(unsigned timeout);
 int			__sync();
-uint32_t			get_info(int param, uint32_t val);
+uint8_t			get_info(int param, uint32_t *val);
 int			erase();
 int			program(size_t fw_size);
 int			verify_rev3(size_t fw_size);
@@ -105,14 +105,6 @@ int send_buf(uint8_t *p, unsigned count)
 void
 send_reboot()
 {
-	/*try reboot via NSH first*/
-//	send_buf(nsh_init , sizeof(nsh_init));
-//	send_buf(nsh_reboot_bl, sizeof(nsh_reboot_bl));
-//	printf("nsh nsh reboot 1\n");
-//	send_buf(nsh_init , sizeof(nsh_init));
-//	send_buf(nsh_reboot_bl, sizeof(nsh_reboot_bl));
-//	printf("nsh nsh reboot 2\n");
-	/*then try MAVLINK command*/
 	send_buf(mavlink_reboot_id1, sizeof(mavlink_reboot_id1));
 	send_buf(mavlink_reboot_id0, sizeof(mavlink_reboot_id0));
 }
@@ -120,13 +112,13 @@ send_reboot()
 int
 recv_byte_with_timeout(uint8_t *c, unsigned timeout)
 {
-	struct pollfd fds[1];
+	struct pollfd fds;
 
-	fds[0].fd = _boot_fd;
-	fds[0].events = POLLIN;
+	fds.fd = _boot_fd;
+	fds.events = POLLIN;
 	
 	/* wait <timout> ms for a character */
-	int ret = poll(&fds[0], 1, timeout);
+	int ret = poll(&fds, 1, timeout);
 
 	if (ret < 1) {
 		printf("poll timeout %d\n", ret);
@@ -193,26 +185,20 @@ __sync()
 	return get_sync(40);
 }
 
-uint32_t
-get_info(int param, uint32_t val)
+uint8_t
+get_info(int param, uint32_t *val)
 { 
 	uint32_t ret; 
-//	uint8_t info[4];
 	
 	send(PROTO_GET_DEVICE);
 	send(param);
 	send(PROTO_EOC);
 
-	ret = recv_bytes((uint8_t *)&val, sizeof(val));
-	//ret = recv_bytes(info, sizeof(*val));
+	ret = recv_bytes((uint8_t *)val, sizeof(*val));
 
-//	*val = info[0] + (info[1] << 8) + (info[2] << 16) + (info[3] << 24);
 	if (ret != OK)
 		return ret;
-	//return get_sync(40);
-	get_sync(40);
-
-	return val;
+	return get_sync(40);
 }
 
 //int
@@ -240,11 +226,6 @@ erase()
 	while(time(NULL) < deadline)
 	{
 		printf("erase : %.0f\n", (float)(20-(deadline-time(NULL)))/20.0*100);
-//		if(__sync())
-//		{
-//	//		printf("erase : %.0f\n", 100.0);
-//			return OK;	
-//		}
 		usleep(100000);
 	}
 	if(__sync() == OK)
@@ -274,7 +255,6 @@ read_with_retry(int fd, void *buf, size_t n)
 int
 program(size_t fw_size)
 {
-//	uint8_t	*file_buf;
 	ssize_t count;
 	int ret;
 	size_t sent = 0;
@@ -343,14 +323,13 @@ verify_rev3(size_t fw_size_local)
 	printf("verify...\n");
 	lseek(_fw_fd, 0, SEEK_SET);
 
-	fw_size_remote = get_info(INFO_FLASH_SIZE, fw_size_remote);
-	//ret = get_info(INFO_FLASH_SIZE, fw_size_remote);
+	ret = get_info(INFO_FLASH_SIZE, &fw_size_remote);
 	send(PROTO_EOC);
 
-//	if (ret != OK) {
-//		printf("could not read firmware size\n");
-//		return ret;
-//	}
+	if (ret != OK) {
+		printf("could not read firmware size\n");
+		return ret;
+	}
 
 	/* read through the firmware file again and calculate the checksum*/
 	while (bytes_read < fw_size_local) {
@@ -620,16 +599,15 @@ upload(const char *filenames)
 				}
 			}
 	
-			bl_rev = get_info(INFO_BL_REV, bl_rev);
-			//uint32_t *fw_size_w;
-			//ret = get_info(2, fw_size_w);
-			//
+			ret = get_info(INFO_BL_REV, &bl_rev);
+			
 			if(ret != OK)
 			{
 				return OK;
 			}
 	
-		//	if (ret == OK) {
+			if (ret == OK) {
+				printf("bl_rev\n");
 				if (bl_rev <= BL_REV) {
 					printf("found bootloader revision: %d\n", bl_rev);
 				} else {
@@ -639,7 +617,7 @@ upload(const char *filenames)
 					_boot_fd = -1;
 					return OK;
 				}
-		//	}
+			}
 	
 			ret = erase();
 	
