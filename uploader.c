@@ -12,56 +12,7 @@
 #include <poll.h>
 #include <errno.h>
 #include "crc32.h"
-
-#define OK						0
-#define PROTO_NOP			 0x00
-#define PROTO_OK			 0x10
-#define PROTO_FAILED		 0x11
-#define PROTO_INSYNC		 0x12
-#define PROTO_EOC			 0x20
-#define PROTO_GET_SYNC		 0x21
-#define PROTO_GET_DEVICE	 0x22
-#define PROTO_CHIP_ERASE	 0x23
-#define PROTO_CHIP_VERIFY	 0x24
-#define PROTO_PROG_MULTI	 0x27
-#define PROTO_READ_MULTI	 0x28
-#define PROTO_GET_CRC		 0x29
-#define PROTO_REBOOT		 0x30
-
-#define INFO_BL_REV			 1		/**< bootloader protocol revision */
-#define BL_REV				 4		/**< supported bootloader protocol  */
-#define INFO_BOARD_ID		 2		/**< board type */
-#define INFO_BOARD_REV		 3		/**< board revision */
-#define INFO_FLASH_SIZE		 4		/**< max firmware size in bytes */
-
-#define PROG_MULTI_MAX		 252		/**< protocol max is 255, must be multiple of 4 */
-
-uint8_t nsh_init[] = {0x0d, 0x0d, 0x0d};
-char nsh_reboot_bl[] = "reboot -b \n";
-char nsh_reboot[] = "reboot\n";
-uint8_t mavlink_reboot_id1[] = {0xfe, 0x21, 0x72, 0xff, 0x00, 0x4c, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf6, 0x00, 0x01, 0x00, 0x00, 0x48, 0xf0}; 
-uint8_t mavlink_reboot_id0[] = {0xfe, 0x21, 0x45, 0xff, 0x00, 0x4c, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf6, 0x00, 0x00, 0x00, 0x00, 0xd7, 0xac};
-
-int _boot_fd = -1;
-int _fw_fd = -1;
-
-struct termios uart_config_original;
-
-uint32_t		bl_rev; /**< bootloader revision */
-
-int			recv_byte_with_timeout(uint8_t *c, unsigned timeout);
-int			recv_bytes(uint8_t *p, unsigned count);
-void			drain();
-int			send(uint8_t c);
-int			send_buf(uint8_t *p, unsigned count);
-int			get_sync(unsigned timeout);
-int			__sync();
-uint8_t			get_info(int param, uint32_t *val);
-int			erase();
-int			program(size_t fw_size);
-int			verify_rev3(size_t fw_size);
-int			reboot();
-int			upload(const char *filenames);
+#include "upload.h"
 
 void
 drain()
@@ -122,7 +73,7 @@ recv_byte_with_timeout(uint8_t *c, unsigned timeout)
 
 	if (ret < 1) {
 		printf("poll timeout %d\n", ret);
-		return -ETIMEDOUT;
+		return -1;
 	}
 	
 	ret = read(_boot_fd, c, 1);
@@ -165,11 +116,10 @@ get_sync(unsigned timeout)
 	{
 		return ret;
 	}
-		printf("bad sync 0x%02x,0x%02x\n", c[0], c[1]);
 
 	if ((c[0] != PROTO_INSYNC) || (c[1] != PROTO_OK)) {
 		printf("bad sync 0x%02x,0x%02x\n", c[0], c[1]);
-		return -EIO;
+		return -1;
 	}
 
 	return OK;
@@ -201,19 +151,11 @@ get_info(int param, uint32_t *val)
 	return get_sync(40);
 }
 
-//int
-//erase()
-//{
-//	printf("erase...\n");
-//	send(PROTO_CHIP_ERASE);
-//	send(PROTO_EOC);
-//	
-//	return get_sync(10000);		/* allow 10s timeout */
-//}
 int
 erase()
 {
 	time_t erase_start, deadline;
+	firmware_step = 1;
 	
 	printf("erase...\n");
 	erase_start = time(NULL);
@@ -225,7 +167,8 @@ erase()
 	deadline = erase_start + 20;
 	while(time(NULL) < deadline)
 	{
-		printf("erase : %.0f\n", (float)(20-(deadline-time(NULL)))/20.0*100);
+		firmware_progress = (int)((20-(deadline-time(NULL)))/20.0*100);
+		printf("erase : %d\n", firmware_progress);
 		usleep(100000);
 	}
 	if(__sync() == OK)
@@ -233,7 +176,7 @@ erase()
 		return OK;
 	}
 	printf("erase timeout");
-	return -1;		/* allow 10s timeout */
+	return -1;		
 }
 
 int
@@ -260,12 +203,13 @@ program(size_t fw_size)
 	size_t sent = 0;
 
 	uint8_t file_buf[PROG_MULTI_MAX];
+	firmware_step = 2;
 
 	memset(file_buf, 0, sizeof(file_buf));
 
 	if (!file_buf) {
 		printf("Can't allocate program buffer\n");
-		return -ENOMEM;
+		return -1;
 	}
 
 
@@ -303,7 +247,8 @@ program(size_t fw_size)
 		if (ret != OK) {
 			break;
 		}
-		printf("program: %.2f \n",(float)sent/(float)fw_size*100);
+		firmware_progress = (int)((float)sent/(float)fw_size*100.0);
+		printf("program: %d \n", firmware_progress);
 	}
 	return ret;
 }
@@ -319,6 +264,8 @@ verify_rev3(size_t fw_size_local)
 	uint32_t crc = 0;
 	uint32_t fw_size_remote;
 	uint8_t fill_blank = 0xff;
+
+	firmware_step = 3;
 
 	printf("verify...\n");
 	lseek(_fw_fd, 0, SEEK_SET);
@@ -353,13 +300,14 @@ verify_rev3(size_t fw_size_local)
 		}
 		/* stop if the file cannot be read */
 		if (count < 0)
-			return -errno;
+			return -1;
 
 		/* calculate crc32 sum */
 		sum = crc32part((uint8_t *)&file_buf, sizeof(file_buf), sum);
 
 		bytes_read += count;
-		printf("verify : %.2f \n", (float)bytes_read/(float)fw_size_local*100);
+		firmware_progress = (int)((float)bytes_read/(float)fw_size_local*100.0);
+		printf("verify : %d \n", firmware_progress);
 	}
 
 	/* fill the rest with 0xff */
@@ -382,7 +330,7 @@ verify_rev3(size_t fw_size_local)
 	/* compare the CRC sum from the IO with the one calculated */
 	if (sum != crc) {
 		printf("CRC wrong: received: %d, expected: %d\n", crc, sum);
-		return -EINVAL;
+		return -1;
 	}
 
 	return OK;
@@ -488,6 +436,8 @@ open_uart(const char *uart_name, int baud)
 	/*disable parity bit*/
 	uart_config.c_cflag &= ~PARENB;
 	
+	/* Put in raw mode */
+	cfmakeraw(&uart_config);
 
 	/* set baud rate*/
 	if(cfsetispeed(&uart_config, speed) < 0 || cfsetospeed(&uart_config, speed) < 0)
@@ -537,7 +487,7 @@ upload(const char *filenames)
 		printf("no firmware found\n");
 		close(_boot_fd);
 		_boot_fd = -1;
-		return -ENOENT;
+		return -1;
 	}
 
 	{
@@ -561,7 +511,7 @@ upload(const char *filenames)
 		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
 		close(_boot_fd);
 		_boot_fd = -1;
-		return -EIO;
+		return -1;
 	}
 
 	struct stat st;
@@ -570,7 +520,7 @@ upload(const char *filenames)
 		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
 		close(_boot_fd);
 		_boot_fd = -1;
-		return -errno;
+		return -1;
 	}
 	fw_size = st.st_size;
 
@@ -578,7 +528,7 @@ upload(const char *filenames)
 		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
 		close(_boot_fd);
 		_boot_fd = -1;
-		return -ENOENT;
+		return -1;
 	}
 
 	{
@@ -595,7 +545,7 @@ upload(const char *filenames)
 					tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
 					close(_boot_fd);
 					_boot_fd = -1;
-					return -EIO;
+					return -1;
 				}
 			}
 	
@@ -669,6 +619,26 @@ upload(const char *filenames)
 	return ret;
 }
 
+int autopilot_upgrade_start(const char *dev, const int baudrate, const char *filenames)
+{
+	int ret = -1;
+	
+	ret = open_uart(dev, baudrate);
+	if(ret < OK)
+	{
+		goto stop;
+	}
+	ret = upload(filenames);
+
+stop:return ret;
+}
+
+void autopilot_upgrade_progress(int *step, int *progress)
+{
+	*step = firmware_step;
+	*progress = firmware_progress;
+}
+
 int
 main()
 {
@@ -676,14 +646,9 @@ main()
 	char *fn;
 	const char *uart_name = "/dev/ttyUSB0";
 	int baud = 115200;
-	
-	ret = open_uart(uart_name, baud);
-	if(ret < OK)
-	{
-		goto stop;
-	}
 	fn="./firmware.bin";
-	ret = upload(fn);
 
-stop:return ret;
+	ret = autopilot_upgrade_start(uart_name, baud, fn);	
+	
+	return ret;
 }
