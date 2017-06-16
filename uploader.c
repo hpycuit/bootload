@@ -1,12 +1,8 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <stdbool.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <assert.h>
-#include <stdlib.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <pthread.h>
 #include <errno.h>
 #include <string.h>
 #include <poll.h>
@@ -37,10 +33,12 @@
 
 #define PROG_MULTI_MAX		 252		/**< protocol max is 255, must be multiple of 4 */
 
-#define ERASE				1
-#define PROGRAM				2
-#define VERIFY				3
 
+int err = 0;
+bool start = false;
+const char *device;
+int baud;
+const char *file;
 uint8_t nsh_init[] = {0x0d, 0x0d, 0x0d};
 char nsh_reboot_bl[] = "reboot -b \n";
 char nsh_reboot[] = "reboot\n";
@@ -70,6 +68,8 @@ int			program(size_t fw_size);
 int			verify_rev3(size_t fw_size);
 int			reboot();
 int			upload(const char *filenames);
+void		*upgrade_start(void *arg);
+
 void
 drain()
 {
@@ -83,7 +83,8 @@ drain()
 		ret = recv_byte_with_timeout(&c, 40);
 
 		if (ret == OK) {
-			printf("discard 0x%02x\n", c);
+			printf("\033[4;0H\033[2K\rdiscard 0x%02x\n", c);
+			fflush(stdout);
 		}
 	} while (ret == OK);
 }
@@ -112,6 +113,7 @@ int send_buf(uint8_t *p, unsigned count)
 void
 send_reboot()
 {
+	send_buf(nsh_reboot, sizeof(nsh_reboot));
 	send_buf(mavlink_reboot_id1, sizeof(mavlink_reboot_id1));
 	send_buf(mavlink_reboot_id0, sizeof(mavlink_reboot_id0));
 }
@@ -128,7 +130,8 @@ recv_byte_with_timeout(uint8_t *c, unsigned timeout)
 	int ret = poll(&fds, 1, timeout);
 
 	if (ret < 1) {
-		printf("poll timeout %d\n", ret);
+		printf("\033[4;0H\033[2K\rpoll timeout %d\n", ret);
+		fflush(stdout);
 		return -1;
 	}
 	
@@ -163,7 +166,8 @@ get_sync(unsigned timeout)
 
 	if (ret != OK)
 	{
-		printf("get_sync timeout\n");
+		printf("\033[4;0H\033[2K\rget_sync timeout\n");
+		fflush(stdout);
 		return ret;
 	}
 
@@ -174,11 +178,12 @@ get_sync(unsigned timeout)
 	}
 
 	if ((c[0] != PROTO_INSYNC) || (c[1] != PROTO_OK)) {
-		printf("bad sync 0x%02x,0x%02x\n", c[0], c[1]);
+		printf("\033[4;0H\033[2K\rbad sync 0x%02x,0x%02x\n", c[0], c[1]);
+		fflush(stdout);
 		return -1;
 	}
 
-	return OK;
+	return ret;
 }
 /*make sure we are in sync before starting*/
 int 
@@ -210,29 +215,38 @@ get_info(int param, uint32_t *val)
 int
 erase()
 {
+	int ret = -1;
 	time_t erase_start, deadline;
 	firmware_step = 1;
 	
-	printf("erase...\n");
+	printf("\033[4;0H\033[2K\rerase...\n");
+	fflush(stdout);
 	erase_start = time(NULL);
 	
-	printf("erase...\n");
+	printf("\033[4;0H\033[2K\rerase...\n");
+	fflush(stdout);
 	send(PROTO_CHIP_ERASE);
 	send(PROTO_EOC);
 	
 	deadline = erase_start + 20;
-	while(time(NULL) < deadline)
+	while (time(NULL) < deadline)
 	{
-		firmware_progress = (int)((20-(deadline-time(NULL)))/20.0*100);
-		printf("erase : %d\n", firmware_progress);
-		usleep(100000);
+		ret = get_sync(100);
+		if (ret == OK) {
+			firmware_progress = 100;
+			break;
+		} else {
+			firmware_progress = (int)((20-(deadline-time(NULL)))/20.0*100);
+			printf("\033[4;0H\033[2K\rerase : %d\n", firmware_progress);
+			fflush(stdout);
+		}
 	}
-	if(__sync() == OK)
-	{
-		return OK;
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rerase timeout");
+		fflush(stdout);
 	}
-	printf("erase timeout");
-	return -1;		
+	return ret;	
 }
 
 int
@@ -244,9 +258,10 @@ read_with_retry(int fd, void *buf, size_t n)
 		ret = read(fd, buf, n);
 	} while (ret == -1 && retries++ < 100);
 	if (retries != 0) {
-		printf("read of %u bytes needed %u retries\n",
+		printf("\033[4;0H\033[2K\rread of %u bytes needed %u retries\n",
 		       (unsigned)n,
 		       (unsigned)retries);
+		fflush(stdout);
 	}
 	return ret;
 }
@@ -264,14 +279,21 @@ program(size_t fw_size)
 	memset(file_buf, 0, sizeof(file_buf));
 
 	if (!file_buf) {
-		printf("Can't allocate program buffer\n");
+		printf("\033[4;0H\033[2K\rCan't allocate program buffer\n");
+		fflush(stdout);
 		return -1;
 	}
 
-
-	printf("programming %u bytes...\n", (unsigned)fw_size);
+	printf("\033[4;0H\033[2K\rprogramming %u bytes...\n", (unsigned)fw_size);
+	fflush(stdout);
 
 	ret = lseek(_fw_fd, 0, SEEK_SET);
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rlseek fail\n");
+		fflush(stdout);
+		return ret;
+	}
 
 	while (sent < fw_size) {
 		/* get more bytes to program */
@@ -282,11 +304,12 @@ program(size_t fw_size)
 		count = read_with_retry(_fw_fd, file_buf, n);
 
 		if (count != (ssize_t)n) {
-			printf("firmware read of %u bytes at %u failed -> %d errno %d\n", 
+			printf("\033[4;0H\033[2K\rfirmware read of %u bytes at %u failed -> %d errno %d\n", 
 			    (unsigned)n,
 			    (unsigned)sent,
 			    (int)count,
 			    (int)errno);
+			fflush(stdout);
 			ret = -errno;
 			break;
 		}
@@ -304,7 +327,8 @@ program(size_t fw_size)
 			break;
 		}
 		firmware_progress = (int)((float)sent/(float)fw_size*100.0);
-		printf("program: %d \n", firmware_progress);
+		printf("\033[4;0H\033[2K\rprogram: %d \n", firmware_progress);
+		fflush(stdout);
 	}
 	return ret;
 }
@@ -323,14 +347,22 @@ verify_rev3(size_t fw_size_local)
 
 	firmware_step = 3;
 
-	printf("verify...\n");
-	lseek(_fw_fd, 0, SEEK_SET);
+	printf("\033[4;0H\033[2K\rverify...\n");
+	fflush(stdout);
+	ret = lseek(_fw_fd, 0, SEEK_SET);
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rlseek fail\n");
+		fflush(stdout);
+		return ret;
+	}
 
 	ret = get_info(INFO_FLASH_SIZE, &fw_size_remote);
 	send(PROTO_EOC);
 
 	if (ret != OK) {
-		printf("could not read firmware size\n");
+		printf("\033[4;0H\033[2K\rcould not read firmware size\n");
+		fflush(stdout);
 		return ret;
 	}
 
@@ -343,11 +375,12 @@ verify_rev3(size_t fw_size_local)
 		count = read_with_retry(_fw_fd, file_buf, n);
 
 		if (count != (ssize_t)n) {
-			printf("firmware read of %u bytes at %u failed -> %d errno %d\n", 
+			printf("\033[4;0H\033[2K\rfirmware read of %u bytes at %u failed -> %d errno %d\n", 
 			    (unsigned)n,
 			    (unsigned)bytes_read,
 			    (int)count,
 			    (int)errno);
+			fflush(stdout);
 		}
 
 		/* set the rest to ff */
@@ -363,7 +396,8 @@ verify_rev3(size_t fw_size_local)
 
 		bytes_read += count;
 		firmware_progress = (int)((float)bytes_read/(float)fw_size_local*100.0);
-		printf("verify : %d \n", firmware_progress);
+		printf("\033[4;0H\033[2K\rverify : %d \n", firmware_progress);
+		fflush(stdout);
 	}
 
 	/* fill the rest with 0xff */
@@ -379,13 +413,15 @@ verify_rev3(size_t fw_size_local)
 	ret = recv_bytes((uint8_t*)(&crc), sizeof(crc));
 
 	if (ret != OK) {
-		printf("did not receive CRC checksum\n");
+		printf("\033[4;0H\033[2K\rdid not receive CRC checksum\n");
+		fflush(stdout);
 		return ret;
 	}
 
 	/* compare the CRC sum from the IO with the one calculated */
 	if (sum != crc) {
-		printf("CRC wrong: received: %d, expected: %d\n", crc, sum);
+		printf("\033[4;0H\033[2K\rCRC wrong: received: %d, expected: %d\n", crc, sum);
+		fflush(stdout);
 		return -1;
 	}
 
@@ -460,7 +496,8 @@ open_uart(const char *uart_name, int baud)
 	
 	if(_boot_fd < 0)
 	{
-		printf("ERR OPEN :%s\n", uart_name);
+		printf("\033[4;0H\033[2K\rERR OPEN :%s\n", uart_name);
+		fflush(stdout);
 		return _boot_fd;
 	}
 	
@@ -471,8 +508,10 @@ open_uart(const char *uart_name, int baud)
 	/* Back up the original uart configuration to restore it after exit*/
 	if((termios_state = tcgetattr(_boot_fd, &uart_config_original)) < 0)
 	{
-		printf("ERR GET CONF %s: %d\n", uart_name, termios_state);
+		printf("\033[4;0H\033[2K\rERR GET CONF %s: %d\n", uart_name, termios_state);
+		fflush(stdout);
 		close(_boot_fd);
+		_boot_fd = -1;
 		return -1;
 	}	
 	
@@ -498,200 +537,189 @@ open_uart(const char *uart_name, int baud)
 	/* set baud rate*/
 	if(cfsetispeed(&uart_config, speed) < 0 || cfsetospeed(&uart_config, speed) < 0)
 	{
-		printf("ERR SET BAUD %s: %d\n", uart_name, termios_state);
+		printf("\033[4;0H\033[2K\rERR SET BAUD %s: %d\n", uart_name, termios_state);
+		fflush(stdout);
 		close(_boot_fd);
+		_boot_fd = -1;
 		return -1;
 	}
 	
 	if((termios_state = tcsetattr(_boot_fd, TCSANOW, &uart_config)) < 0)
 	{
-		printf("ERR SET CONF %s\n", uart_name);
+		printf("\033[4;0H\033[2K\rERR SET CONF %s\n", uart_name);
+		fflush(stdout);
 		close(_boot_fd);
 		return -1;
 	}
 	
-	printf("open %s successed\n", uart_name);
+	printf("\033[4;0H\033[2K\ropen %s successed\n", uart_name);
+	fflush(stdout);
 
 	return OK;
 }
 
+
 int
-upload(const char *filenames)
+upload(const char *filename)
 {
-	int	ret;
-	const char *filename = NULL;
+	int ret = -1;
 	size_t fw_size;
-	
-	{
-		unsigned i;
-		/* allow an early abort and look for file first */
-		for (i = 0; filenames != NULL; i++) {
-			_fw_fd = open(filenames, O_RDONLY);
-	
-			if (_fw_fd < 0) {
-				printf("failed to open %s\n", filenames);
-				continue;
-			}
-	
-			printf("using firmware from %s\n", filenames);
-			filename = filenames;
-			break;
-		}
-	}
-
 	if (filename == NULL) {
-		printf("no firmware found\n");
-		close(_boot_fd);
-		_boot_fd = -1;
-		return -1;
+		printf("\033[4;0H\033[2K\rno file name\n");
+		fflush(stdout);
+		goto upload_fail;
+	}
+	
+	_fw_fd = open(filename, O_RDONLY);
+
+	if (_fw_fd < 0) {
+		printf("\033[4;0H\033[2K\rfailed to open %s\n", filename);
+		fflush(stdout);
+		goto upload_fail;
 	}
 
-	{
-		int i;
-		/* look for the bootloader*/
-		while(1)
-		{
-			ret = __sync();
-			if (ret == OK) {
-				break;
-			} else {
-				send_reboot();
-				usleep(1000000);
-			}
+	printf("\033[4;0H\033[2K\rusing firmware from %s\n", filename);
+	fflush(stdout);
+
+	int i;
+	/* look for the bootloader*/
+	for (i = 0; i < 15; i++) {
+		ret = __sync();
+		if (ret == OK) {
+			break;
+		} else {
+			send_reboot();
+			usleep(1000000);
 		}
 	}
 	
 	if (ret != OK) {
 		/* this is immediately fatal */
-		printf("bootloader not responding\n");
-		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-		close(_boot_fd);
-		_boot_fd = -1;
-		return -1;
+		printf("\033[4;0H\033[2K\rbootloader not responding\n");
+		fflush(stdout);
+		goto upload_fail;
 	}
 
 	struct stat st;
 	if (stat(filename, &st) != 0) {
-		printf("Failed to stat %s - %d\n", filename, (int)errno);
-		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-		close(_boot_fd);
-		_boot_fd = -1;
-		return -1;
+		printf("\033[4;0H\033[2K\rFailed to stat %s - %d\n", filename, (int)errno);
+		fflush(stdout);
+		goto upload_fail;
 	}
 	fw_size = st.st_size;
 
-	if (_fw_fd == -1) {
-		tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-		close(_boot_fd);
-		_boot_fd = -1;
-		return -1;
+	ret = get_info(INFO_BL_REV, &bl_rev);
+	
+	if (ret != OK) {
+		goto upload_fail;
 	}
 
-	{
-		unsigned retries;
-		/* do the usual program thing - allow for failure */
-		for (retries = 0; retries < 1; retries++) {
-			if (retries > 0) {
-				printf("retrying update...\n");
-				ret = __sync();
-	
-				if (ret != OK) {
-					/* this is immediately fatal */
-					printf("bootloader not responding\n");
-					tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-					close(_boot_fd);
-					_boot_fd = -1;
-					return -1;
-				}
-			}
-	
-			ret = get_info(INFO_BL_REV, &bl_rev);
-			
-			if(ret != OK)
-			{
-				return OK;
-			}
-	
-			if (ret == OK) {
-				printf("bl_rev\n");
-				if (bl_rev <= BL_REV) {
-					printf("found bootloader revision: %d\n", bl_rev);
-				} else {
-					printf("found unsupported bootloader revision %d, exiting\n", bl_rev);
-					tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-					close(_boot_fd);
-					_boot_fd = -1;
-					return OK;
-				}
-			}
-	
-			ret = erase();
-	
-			if (ret != OK) {
-				printf("erase failed\n");
-				continue;
-			}
-	
-			ret = program(fw_size);
-	
-			if (ret != OK) {
-				printf("program failed\n");
-				continue;
-			}
-	
-			ret = verify_rev3(fw_size);
-
-			if (ret != OK) {
-				printf("verify failed\n");
-				continue;
-			}
-	
-			ret = reboot();
-	
-			if (ret != OK) {
-				printf("reboot failed\n");
-				tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
-				close(_boot_fd);
-				_boot_fd = -1;
-				return ret;
-			}
-	
-			printf("update complete\n");
-	
-			ret = OK;
-			break;
+	if (ret == OK) {
+		printf("\033[4;0H\033[2K\rbl_rev\n");
+		if (bl_rev <= BL_REV) {
+			printf("\033[4;0H\033[2K\rfound bootloader revision: %d\n", bl_rev);
+			fflush(stdout);
+		} else {
+			printf("\033[4;0H\033[2K\rfound unsupported bootloader revision %d, exiting\n", bl_rev);
+			fflush(stdout);
+			goto upload_fail;
 		}
 	}
 
-	/* reset uart to previous/default baudrate */
-	tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
+	ret = erase();
 
-	close(_fw_fd);
-	close(_boot_fd);
-	_boot_fd = -1;
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rerase failed\n");
+		fflush(stdout);
+		goto upload_fail;
+	}
+
+	ret = program(fw_size);
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rprogram failed\n");
+		fflush(stdout);
+		goto upload_fail;
+	}
+
+	ret = verify_rev3(fw_size);
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rverify failed\n");
+		fflush(stdout);
+		goto upload_fail;
+	}
+
+	ret = reboot();
+
+	if (ret != OK) {
+		printf("\033[4;0H\033[2K\rreboot failed\n");
+		fflush(stdout);
+		goto upload_fail;
+	}
+
+	printf("\033[4;0H\033[2K\rupdate complete\n");
+	fflush(stdout);
+	
+upload_fail:
+	if(_fw_fd > 0) {
+		close(_fw_fd);
+		_fw_fd = -1;
+	}
+
+	err = ret;
 
 	usleep(100*1000);
 
 	return ret;
 }
 
-int autopilot_upgrade_start(const char *dev, const int baudrate, const char *filenames)
+void *upgrade_start(void *arg)
 {
-	int ret = -1;
-	
-	ret = open_uart(dev, baudrate);
-	if(ret < OK)
-	{
-		goto stop;
+	int ret;
+	ret = open_uart(device, baud);
+	if(ret == OK) {
+		ret = upload(file);
 	}
-	ret = upload(filenames);
-
-stop:return ret;
+		
+	tcsetattr(_boot_fd, TCSANOW, &uart_config_original);
+	close(_boot_fd);
+	_boot_fd = -1;
 }
 
-void autopilot_upgrade_progress(int *step, int *progress)
+int autopilot_upgrade_start(const char *dev, const int baudrate, const char *filenames)
 {
+	int ret;
+	pthread_t upgrade_thread;
+	start = true;
+
+	device = dev;
+	baud = baudrate;
+	file = filenames;
+
+	ret = pthread_create(&upgrade_thread, NULL, upgrade_start, NULL);
+	
+	pthread_detach(upgrade_thread);
+
+	return ret;
+}
+
+int get_upgrade_progress(bool *complete, int *step, int *progress)
+{
+	if (start != true)
+	{
+		printf("can't start upgrade, please try ""start""");
+		return -1;
+	}
 	*step = firmware_step;
 	*progress = firmware_progress;
+	if((firmware_step == VERIFY) && (firmware_progress == 100))
+	{
+		*complete = true;
+	} else {
+		*complete = false;
+	}
+
+	return err;
 }
 

@@ -4,7 +4,7 @@ loop=1
 
 while(($loop<=200))
 do 
-	if ./bootloader == 0
+	if ./bootloader start == 0
 	then
 		echo "success $loop" >> ./log.txt 
 	else
